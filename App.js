@@ -1,68 +1,28 @@
-import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Animated } from 'react-native';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { StyleSheet, View, Text, TouchableOpacity, Animated, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 
 const GLASS_SIZE = 250; // ml
 const DAILY_GOAL = 2000; // ml
+const MAX_INTAKE = DAILY_GOAL + 1000; // Cap at goal + 1L
+
+const STORAGE_KEYS = {
+  LAST_RESET: 'water_tracker_last_reset',
+  INTAKE: 'water_tracker_intake',
+};
 
 export default function App() {
   const [intake, setIntake] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
   const [goalReached, setGoalReached] = useState(false);
-  const [celebrationAnim] = useState(new Animated.Value(0));
+  
+  // useRef for animation to avoid recreating on each render
+  const celebrationAnim = useRef(new Animated.Value(0)).current;
+  // Track if initial load is complete to prevent saving during load
+  const isInitialized = useRef(false);
 
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  useEffect(() => {
-    saveData();
-    if (intake >= DAILY_GOAL && !goalReached) {
-      setGoalReached(true);
-      celebrate();
-    }
-  }, [intake]);
-
-  const loadData = async () => {
-    try {
-      const today = new Date().toDateString();
-      const savedDate = await AsyncStorage.getItem('lastReset');
-      
-      if (savedDate !== today) {
-        // New day, reset
-        await AsyncStorage.setItem('lastReset', today);
-        await AsyncStorage.setItem('intake', '0');
-        setIntake(0);
-        setGoalReached(false);
-      } else {
-        const savedIntake = await AsyncStorage.getItem('intake');
-        if (savedIntake) {
-          const intakeValue = parseInt(savedIntake);
-          setIntake(intakeValue);
-          if (intakeValue >= DAILY_GOAL) {
-            setGoalReached(true);
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error loading data:', error);
-    }
-  };
-
-  const saveData = async () => {
-    try {
-      await AsyncStorage.setItem('intake', intake.toString());
-    } catch (error) {
-      console.error('Error saving data:', error);
-    }
-  };
-
-  const addGlass = () => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setIntake(prev => Math.min(prev + GLASS_SIZE, DAILY_GOAL + 1000)); // Cap at goal + 1L
-  };
-
-  const celebrate = () => {
+  const celebrate = useCallback(() => {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     Animated.sequence([
       Animated.timing(celebrationAnim, {
@@ -76,7 +36,78 @@ export default function App() {
         useNativeDriver: true,
       }),
     ]).start();
-  };
+  }, [celebrationAnim]);
+
+  // Load data on mount
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const today = new Date().toDateString();
+        const savedDate = await AsyncStorage.getItem(STORAGE_KEYS.LAST_RESET);
+        
+        if (savedDate !== today) {
+          // New day, reset
+          await AsyncStorage.multiSet([
+            [STORAGE_KEYS.LAST_RESET, today],
+            [STORAGE_KEYS.INTAKE, '0'],
+          ]);
+          setIntake(0);
+          setGoalReached(false);
+        } else {
+          const savedIntake = await AsyncStorage.getItem(STORAGE_KEYS.INTAKE);
+          if (savedIntake !== null) {
+            const intakeValue = parseInt(savedIntake, 10);
+            if (!isNaN(intakeValue)) {
+              setIntake(intakeValue);
+              setGoalReached(intakeValue >= DAILY_GOAL);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error loading data:', error);
+      } finally {
+        setIsLoading(false);
+        isInitialized.current = true;
+      }
+    };
+
+    loadData();
+  }, []);
+
+  // Save data when intake changes (only after initial load)
+  useEffect(() => {
+    if (!isInitialized.current) return;
+
+    const saveData = async () => {
+      try {
+        await AsyncStorage.setItem(STORAGE_KEYS.INTAKE, intake.toString());
+      } catch (error) {
+        console.error('Error saving data:', error);
+      }
+    };
+
+    saveData();
+  }, [intake]);
+
+  // Check for goal completion
+  useEffect(() => {
+    if (!isInitialized.current) return;
+    
+    if (intake >= DAILY_GOAL && !goalReached) {
+      setGoalReached(true);
+      celebrate();
+    }
+  }, [intake, goalReached, celebrate]);
+
+  const addGlass = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setIntake(prev => Math.min(prev + GLASS_SIZE, MAX_INTAKE));
+  }, []);
+
+  const removeGlass = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setIntake(prev => Math.max(prev - GLASS_SIZE, 0));
+  }, []);
 
   const progress = Math.min(intake / DAILY_GOAL, 1);
   const glassesCount = Math.floor(intake / GLASS_SIZE);
@@ -85,6 +116,15 @@ export default function App() {
     inputRange: [0, 1],
     outputRange: [1, 1.2],
   });
+
+  if (isLoading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#2196F3" />
+        <Text style={styles.loadingText}>Loading...</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -114,15 +154,27 @@ export default function App() {
         <Text style={styles.congratulations}>🎉 Goal Reached! 🎉</Text>
       )}
 
-      <TouchableOpacity 
-        style={styles.button}
-        onPress={addGlass}
-        activeOpacity={0.7}
-      >
-        <Text style={styles.buttonIcon}>💧</Text>
-        <Text style={styles.buttonText}>Add Glass</Text>
-        <Text style={styles.buttonSubtext}>(250ml)</Text>
-      </TouchableOpacity>
+      <View style={styles.buttonRow}>
+        <TouchableOpacity 
+          style={[styles.button, styles.removeButton]}
+          onPress={removeGlass}
+          activeOpacity={0.7}
+          disabled={intake === 0}
+        >
+          <Text style={styles.buttonIcon}>➖</Text>
+          <Text style={styles.smallButtonText}>Remove</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={[styles.button, styles.addButton]}
+          onPress={addGlass}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.buttonIcon}>💧</Text>
+          <Text style={styles.buttonText}>Add Glass</Text>
+          <Text style={styles.buttonSubtext}>({GLASS_SIZE}ml)</Text>
+        </TouchableOpacity>
+      </View>
 
       <View style={styles.glassesContainer}>
         <Text style={styles.glassesText}>
@@ -134,6 +186,17 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: '#E3F2FD',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingText: {
+    marginTop: 12,
+    fontSize: 16,
+    color: '#1976D2',
+  },
   container: {
     flex: 1,
     backgroundColor: '#E3F2FD',
@@ -191,10 +254,14 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     textAlign: 'center',
   },
+  buttonRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 20,
+  },
   button: {
-    backgroundColor: '#2196F3',
-    paddingVertical: 30,
-    paddingHorizontal: 60,
+    paddingVertical: 20,
+    paddingHorizontal: 30,
     borderRadius: 100,
     alignItems: 'center',
     elevation: 5,
@@ -203,12 +270,25 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 5,
   },
+  addButton: {
+    backgroundColor: '#2196F3',
+    paddingVertical: 30,
+    paddingHorizontal: 40,
+  },
+  removeButton: {
+    backgroundColor: '#78909C',
+  },
   buttonIcon: {
-    fontSize: 64,
-    marginBottom: 10,
+    fontSize: 48,
+    marginBottom: 8,
   },
   buttonText: {
     fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  smallButtonText: {
+    fontSize: 16,
     fontWeight: 'bold',
     color: '#fff',
   },
